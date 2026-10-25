@@ -1,0 +1,139 @@
+name: Migrar APK de JWB Player desde repositorio privado
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-jwb-player-releases
+  cancel-in-progress: false
+
+jobs:
+  migrar-releases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_REPO: SoyNonoCL/JWB-Player
+      TARGET_REPO: SoyNonoCL/jwb-player-releases
+      SOURCE_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+      TARGET_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Comprobar autorización de lectura privada
+        shell: bash
+        run: |
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo "::error::Falta el secreto SOURCE_READ_TOKEN en el repositorio público."
+            exit 1
+          fi
+
+      - name: Copiar todos los APK de los Releases publicados
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          work="$RUNNER_TEMP/jwb-release-migration"
+          mkdir -p "$work"
+
+          # Lista paginada del repositorio PRIVADO, sin exponer credenciales.
+          GH_TOKEN="$SOURCE_TOKEN" gh api --paginate \
+            "repos/$SOURCE_REPO/releases?per_page=100" \
+            | jq -s '[.[][] | select(.draft == false)] | sort_by(.published_at)' \
+            > "$work/releases.json"
+
+          count="$(jq 'length' "$work/releases.json")"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::No se encontraron Releases publicados en $SOURCE_REPO."
+            exit 1
+          fi
+
+          newest="$(jq -r '[.[] | select(.prerelease == false)] | last | .tag_name // empty' "$work/releases.json")"
+          migrated=0
+          skipped=0
+
+          {
+            echo "## Migración de JWB Player"
+            echo
+            echo "Origen privado: \`$SOURCE_REPO\`"
+            echo "Destino público: \`$TARGET_REPO\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            echo "::group::Revisando $tag"
+            src_meta="$(jq -c --arg tag "$tag" '.[] | select(.tag_name == $tag)' "$work/releases.json")"
+            title="$(jq -r '.name // ""' <<<"$src_meta")"
+            [[ -n "$title" ]] || title="JWB Player $tag"
+            published="$(jq -r '.published_at // "sin fecha"' <<<"$src_meta")"
+            prerelease="$(jq -r '.prerelease' <<<"$src_meta")"
+
+            # Si ya se copió el release con su APK, no duplicar ni reemplazar.
+            if GH_TOKEN="$TARGET_TOKEN" gh release view "$tag" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+              have_apk="$(GH_TOKEN="$TARGET_TOKEN" gh release view "$tag" --repo "$TARGET_REPO" --json assets \
+                --jq '[.assets[] | select(.name | endswith(".apk"))] | length')"
+              if [[ "$have_apk" -gt 0 ]]; then
+                echo "$tag ya existe con APK; se omite."
+                echo "- $tag: ya disponible" >> "$GITHUB_STEP_SUMMARY"
+                skipped=$((skipped + 1))
+                echo "::endgroup::"
+                continue
+              fi
+            fi
+
+            dir="$work/$tag"
+            mkdir -p "$dir"
+
+            # Descargar solamente los archivos APK del Release privado.
+            GH_TOKEN="$SOURCE_TOKEN" gh release download "$tag" \
+              --repo "$SOURCE_REPO" \
+              --pattern '*.apk' \
+              --dir "$dir"
+
+            mapfile -d '' -t apks < <(find "$dir" -maxdepth 1 -type f -iname '*.apk' -print0)
+            if [[ "${#apks[@]}" -eq 0 ]]; then
+              echo "::error::No hay APK en $tag. Se cancela sin publicar."
+              exit 1
+            fi
+            for apk in "${apks[@]}"; do
+              test -s "$apk" || { echo "::error::APK vacío: $apk"; exit 1; }
+              sha256sum "$apk"
+            done
+
+            body="$(jq -r '.body // ""' <<<"$src_meta")"
+            notes="$dir/NOTAS.txt"
+            {
+              echo "JWB Player $tag — archivo APK publicado para descarga pública."
+              echo
+              echo "Migrado desde un Release existente del repositorio privado JWB-Player."
+              echo "Fecha de publicación original: $published."
+              echo "Este repositorio contiene únicamente archivos de distribución; no publica el código fuente."
+              if [[ -n "$body" ]]; then
+                echo
+                echo "## Notas originales"
+                echo "$body"
+              fi
+            } > "$notes"
+
+            if GH_TOKEN="$TARGET_TOKEN" gh release view "$tag" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+              GH_TOKEN="$TARGET_TOKEN" gh release upload "$tag" "${apks[@]}" --repo "$TARGET_REPO"
+            else
+              args=(--repo "$TARGET_REPO" --title "$title" --notes-file "$notes" --latest=false)
+              if [[ "$prerelease" == "true" ]]; then args+=(--prerelease); fi
+              if [[ "$tag" == "$newest" && "$prerelease" == "false" ]]; then
+                args=(--repo "$TARGET_REPO" --title "$title" --notes-file "$notes" --latest)
+              fi
+              GH_TOKEN="$TARGET_TOKEN" gh release create "$tag" "${apks[@]}" "${args[@]}"
+            fi
+
+            echo "- $tag: APK publicado" >> "$GITHUB_STEP_SUMMARY"
+            migrated=$((migrated + 1))
+            echo "::endgroup::"
+          done < <(jq -r '.[].tag_name' "$work/releases.json")
+
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Migrados: $migrated · Ya existentes: $skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "Releases públicos: https://github.com/$TARGET_REPO/releases" >> "$GITHUB_STEP_SUMMARY"
+          echo "Listo: $migrated publicados, $skipped ya presentes."
